@@ -4,7 +4,7 @@ from typing import List
 
 class Trader:
     """
-    Round 2 Strategy — v2
+    Round 2 Strategy — v3
 
     Products: ASH_COATED_OSMIUM + INTARIAN_PEPPER_ROOT (same as Round 1)
 
@@ -23,12 +23,16 @@ class Trader:
 
     ASH_COATED_OSMIUM  (FV ~10000, mean-reverting)
     ────────────────────────────────────────────────────────────────────
-    Round 2 order book structure vs Round 1:
-      Day -1: ask1 often AT 10000 (tight) — our 10001 ask sits behind
-      Day 0:  ask1 = 10008–10013 — our 10001 ask is BEST by 7+ pts ✓
-      Day 1:  ask1 = 10016–10020 — our 10001 ask is BEST by 15+ pts ✓
-    Days 0 and 1 give us far more ask-side passive fills than Round 1.
-    Parameters unchanged from Round 1 v4 (best-performing version).
+    Round 2 order book structure:
+      Day -1: ask1 often AT 10000 (tight)
+      Day 0:  ask1 = 10008–10013 — our passive ask is BEST by 7+ pts ✓
+      Day 1:  ask1 = 10016–10020 — our passive ask is BEST by 15+ pts ✓
+    Problem in v1/v2: ask side filled MUCH faster than bid side → position
+    drifted to -80 short → locked (sell_cap=0), could not trade.
+    v3 fix: SKEW raised from 0.07 → 0.15. At pos=-80:
+      v2: adj_fv=10005.6, ask≈10010 (9 pts below market) — too competitive
+      v3: adj_fv=10012.0, ask≈10016 (3 pts below market) — far less competitive
+    This dramatically slows ask-side fills when short, letting buys rebalance.
 
     INTARIAN_PEPPER_ROOT  (trends +1000/day)
     ────────────────────────────────────────────────────────────────────
@@ -50,7 +54,7 @@ class Trader:
     ASH_FAIR_VALUE  = 10000
     ASH_HALF_SPREAD = 4      # passive quotes at adj_fv ± 4
     ASH_TAKE_EDGE   = 0      # take any ask strictly < FV (catches 9999 etc.)
-    ASH_SKEW        = 0.07   # adj_fv = FV - SKEW * pos (inventory management)
+    ASH_SKEW        = 0.15   # adj_fv = FV - SKEW * pos (inventory management)
     ASH_MAKE_SIZE   = 30     # units per passive quote
 
     # ── PEPPER parameters ────────────────────────────────────────────────
@@ -73,7 +77,7 @@ class Trader:
             else:
                 orders = []
             result[product] = orders
-        return result, self.MARKET_ACCESS_FEE, "ROUND2_v2"
+        return result, self.MARKET_ACCESS_FEE, "ROUND2_v3"
 
     # ------------------------------------------------------------------
     # ASH_COATED_OSMIUM — inventory-skewed market maker
