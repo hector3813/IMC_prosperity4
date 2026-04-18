@@ -4,7 +4,7 @@ from typing import List
 
 class Trader:
     """
-    Round 2 Strategy — v1
+    Round 2 Strategy — v2
 
     Products: ASH_COATED_OSMIUM + INTARIAN_PEPPER_ROOT (same as Round 1)
 
@@ -73,7 +73,7 @@ class Trader:
             else:
                 orders = []
             result[product] = orders
-        return result, self.MARKET_ACCESS_FEE, "ROUND2_v1"
+        return result, self.MARKET_ACCESS_FEE, "ROUND2_v2"
 
     # ------------------------------------------------------------------
     # ASH_COATED_OSMIUM — inventory-skewed market maker
@@ -120,16 +120,29 @@ class Trader:
         if best_ask is not None:
             our_ask = min(our_ask, best_ask - 1)
 
-        # Hard FV±1 caps — NEVER bid at/above FV, NEVER ask at/below FV.
-        # Keeps per-fill profit intact regardless of inventory skew.
-        our_bid = min(our_bid, FV - 1)
-        our_ask = max(our_ask, FV + 1)
+        # Inventory-aware caps (replaces hard FV±1 from v1):
+        #   adj_fv < FV when long  → cap bid lower (less eager to buy),
+        #                            floor ask lower (sell aggressively)
+        #   adj_fv > FV when short → cap bid higher (buy to cover),
+        #                            floor ask higher (don't sell more)
+        # This fixes the Day-1 problem: market bids at FV=10000, so
+        # FV-1 cap kept us at 9999 (below market) → we lost all buy flow
+        # and drifted to -80 short, stuck. Now we can bid up to adj_fv.
+        our_bid = min(our_bid, round(adj_fv))
+        our_ask = max(our_ask, round(adj_fv))
 
-        # Safety: don't cross the spread
+        # Hard FV guardrail: never bid strictly above FV (avoid adverse
+        # selection) or ask strictly below FV.
+        our_bid = min(our_bid, FV)
+        our_ask = max(our_ask, FV)
+
+        # Safety: don't cross external spread or our own spread
         if best_ask is not None and our_bid >= best_ask:
             our_bid = best_ask - 1
         if best_bid is not None and our_ask <= best_bid:
             our_ask = best_bid + 1
+        if our_ask <= our_bid:
+            our_ask = our_bid + 1
 
         buy_cap  = lim - pos
         sell_cap = lim + pos
