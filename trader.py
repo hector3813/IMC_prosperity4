@@ -4,32 +4,36 @@ from typing import List
 
 class Trader:
     """
-    Round 1 Strategy — v4
+    Round 2 Strategy — v1
 
-    ASH_COATED_OSMIUM  (fair value ~10000, mean-reverting, spread ~16 pts)
-    -----------------------------------------------------------------------
-    Core strategy: inventory-skewed market making with hard FV±1 bounds.
+    Products: ASH_COATED_OSMIUM + INTARIAN_PEPPER_ROOT (same as Round 1)
 
-    Change from v3 → v4:
-      • Revert adj_fv caps back to hard FV-1 / FV+1 bounds.
-        When long, adj_fv cap was lowering our ask to ~9999 (below FV),
-        cutting per-fill profit from ~5 pts to ~3 pts. Combined with
-        the full-capacity posting it cost ~300 pts of ASH PnL.
-      • Revert full-capacity posting back to SIZE=30.
-        Large orders amplified the cheap-ask problem.
-      • KEEP TAKE_EDGE=0: take any ask strictly below FV=10000
-        (catches 4 extra mispriced asks at 9999 per day — free profit).
+    New mechanic: Market Access Fee (MAF)
+    ────────────────────────────────────────────────────────────────────
+    Setting MARKET_ACCESS_FEE bids for the right to access 25% more
+    order book volume. Top 50% of bidders win, pay the fee, and get
+    the extra flow. Losers pay nothing and trade normally.
 
-    Surviving fixes from v2 (vs original 182314.py):
-      • Push-to-front: bid at max(target, best_bid+1),
-                       ask at min(target, best_ask-1)
-      • SIZE=30 (was 15)
-      • SKEW=0.07 (was 0.10)
-      • Position limit 80 (was 20)
+    Incremental value estimate:
+      • ASH passive fills: ~25% more fill opportunities ≈ +400–600 PnL
+      • PEPPER: fills limit 25% faster → more trend capture ≈ +300–500 PnL
+      • Total incremental ≈ 700–1100 PnL/day → ~2100–3300 over round
+    Setting MAF = 2000 to be competitive while staying clearly profitable
+    if we win. Adjust upward if we learn competitors are bidding higher.
 
-    INTARIAN_PEPPER_ROOT  (trends +0.1/100ts = +1000/day)
-    -----------------------------------------------------------------
-    Unchanged: buy to limit immediately, never sell.
+    ASH_COATED_OSMIUM  (FV ~10000, mean-reverting)
+    ────────────────────────────────────────────────────────────────────
+    Round 2 order book structure vs Round 1:
+      Day -1: ask1 often AT 10000 (tight) — our 10001 ask sits behind
+      Day 0:  ask1 = 10008–10013 — our 10001 ask is BEST by 7+ pts ✓
+      Day 1:  ask1 = 10016–10020 — our 10001 ask is BEST by 15+ pts ✓
+    Days 0 and 1 give us far more ask-side passive fills than Round 1.
+    Parameters unchanged from Round 1 v4 (best-performing version).
+
+    INTARIAN_PEPPER_ROOT  (trends +1000/day)
+    ────────────────────────────────────────────────────────────────────
+    Day -1 → Day 0 → Day 1: 11001 → 12000 → 13000 → continues rising.
+    Strategy: buy to limit immediately and hold. Never sell.
     """
 
     POSITION_LIMITS = {
@@ -37,15 +41,20 @@ class Trader:
         "ASH_COATED_OSMIUM": 80,
     }
 
-    # ── ASH parameters ──────────────────────────────────────────────────
+    # ── Market Access Fee ────────────────────────────────────────────────
+    # Bid 2000 XIRECS for 25% more order book volume.
+    # Expected net gain if won: ~100–1300 XIRECS over the round.
+    MARKET_ACCESS_FEE = 2000
+
+    # ── ASH parameters (unchanged from Round 1 v4) ───────────────────────
     ASH_FAIR_VALUE  = 10000
-    ASH_HALF_SPREAD = 4      # offset from adj_fv for passive quotes
-    ASH_TAKE_EDGE   = 0      # take any ask strictly < FV (was 1 in v2, catching < FV-1)
-    ASH_SKEW        = 0.07   # adj_fv = FV - SKEW*pos
+    ASH_HALF_SPREAD = 4      # passive quotes at adj_fv ± 4
+    ASH_TAKE_EDGE   = 0      # take any ask strictly < FV (catches 9999 etc.)
+    ASH_SKEW        = 0.07   # adj_fv = FV - SKEW * pos (inventory management)
     ASH_MAKE_SIZE   = 30     # units per passive quote
 
     # ── PEPPER parameters ────────────────────────────────────────────────
-    PEPPER_TREND_PER_STEP = 0.1
+    PEPPER_TREND_PER_STEP = 0.1   # +0.1 per 100-unit timestamp step
 
     def __init__(self):
         self._pepper_anchor_fv: float | None = None
@@ -64,10 +73,10 @@ class Trader:
             else:
                 orders = []
             result[product] = orders
-        return result, 1, "ROUND1"
+        return result, self.MARKET_ACCESS_FEE, "ROUND2_v1"
 
     # ------------------------------------------------------------------
-    # ASH_COATED_OSMIUM — inventory-skewed market maker (v4)
+    # ASH_COATED_OSMIUM — inventory-skewed market maker
     # ------------------------------------------------------------------
     def _trade_ash(self, od: OrderDepth, pos: int, lim: int) -> List[Order]:
         orders: List[Order] = []
@@ -79,13 +88,15 @@ class Trader:
         best_bid = max(od.buy_orders)  if od.buy_orders  else None
         best_ask = min(od.sell_orders) if od.sell_orders else None
 
+        # Inventory skew: push adj fair value lower when long, higher when short
         adj_fv  = FV - self.ASH_SKEW * pos
         our_bid = round(adj_fv - HS)
         our_ask = round(adj_fv + HS)
 
-        # ── TAKE: buy asks < FV, sell bids > FV ─────────────────────────
+        # ── TAKE: sweep all mispriced orders ────────────────────────────
+        # Buy every ask strictly below FV (EDGE=0 → takes 9999, 9998 …)
         for ask in sorted(od.sell_orders.keys()):
-            if ask >= FV - EDGE:        # EDGE=0 → take anything below 10000
+            if ask >= FV - EDGE:
                 break
             qty = min(abs(od.sell_orders[ask]), lim - pos)
             if qty <= 0:
@@ -93,6 +104,7 @@ class Trader:
             orders.append(Order("ASH_COATED_OSMIUM", ask, qty))
             pos += qty
 
+        # Sell to every bid strictly above FV
         for bid in sorted(od.buy_orders.keys(), reverse=True):
             if bid <= FV + EDGE:
                 break
@@ -108,10 +120,10 @@ class Trader:
         if best_ask is not None:
             our_ask = min(our_ask, best_ask - 1)
 
-        # Hard FV±1 bounds — never buy at/above FV, never sell at/below FV.
-        # Keeps per-fill profit healthy regardless of inventory position.
-        our_bid = min(our_bid, FV - 1)    # reverted from adj_fv-1 (v3 mistake)
-        our_ask = max(our_ask, FV + 1)    # reverted from adj_fv+1 (v3 mistake)
+        # Hard FV±1 caps — NEVER bid at/above FV, NEVER ask at/below FV.
+        # Keeps per-fill profit intact regardless of inventory skew.
+        our_bid = min(our_bid, FV - 1)
+        our_ask = max(our_ask, FV + 1)
 
         # Safety: don't cross the spread
         if best_ask is not None and our_bid >= best_ask:
@@ -124,14 +136,13 @@ class Trader:
 
         if buy_cap > 0:
             orders.append(Order("ASH_COATED_OSMIUM", our_bid, min(SIZE, buy_cap)))
-
         if sell_cap > 0:
             orders.append(Order("ASH_COATED_OSMIUM", our_ask, -min(SIZE, sell_cap)))
 
         return orders
 
     # ------------------------------------------------------------------
-    # INTARIAN_PEPPER_ROOT — buy-and-hold trend follower (unchanged)
+    # INTARIAN_PEPPER_ROOT — buy-and-hold trend follower
     # ------------------------------------------------------------------
     def _trade_pepper(self, od: OrderDepth, pos: int, lim: int,
                       state: TradingState) -> List[Order]:
@@ -140,6 +151,7 @@ class Trader:
         best_ask = min(od.sell_orders) if od.sell_orders else None
         best_bid = max(od.buy_orders)  if od.buy_orders  else None
 
+        # Anchor fair value on first tick for reference
         mid = None
         if best_bid is not None and best_ask is not None:
             mid = (best_bid + best_ask) / 2
@@ -152,7 +164,7 @@ class Trader:
             self._pepper_anchor_fv = mid
             self._pepper_anchor_ts = state.timestamp
 
-        # Buy every ask up to position limit — price always trends up
+        # ── TAKE: sweep all available asks up to position limit ──────────
         for ask_price in sorted(od.sell_orders.keys()):
             if pos >= lim:
                 break
@@ -161,7 +173,7 @@ class Trader:
                 orders.append(Order("INTARIAN_PEPPER_ROOT", ask_price, qty))
                 pos += qty
 
-        # Passive bid at best_bid+1 to catch residual supply
+        # ── MAKE: passive bid at best_bid+1 to catch residual sellers ───
         if pos < lim and best_bid is not None and best_ask is not None:
             our_bid = best_bid + 1
             if our_bid >= best_ask:
