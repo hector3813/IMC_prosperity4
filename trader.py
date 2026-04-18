@@ -4,7 +4,7 @@ from typing import List
 
 class Trader:
     """
-    Round 2 Strategy — v3
+    Round 2 Strategy — v4
 
     Products: ASH_COATED_OSMIUM + INTARIAN_PEPPER_ROOT (same as Round 1)
 
@@ -29,10 +29,13 @@ class Trader:
       Day 1:  ask1 = 10016–10020 — our passive ask is BEST by 15+ pts ✓
     Problem in v1/v2: ask side filled MUCH faster than bid side → position
     drifted to -80 short → locked (sell_cap=0), could not trade.
-    v3 fix: SKEW raised from 0.07 → 0.15. At pos=-80:
-      v2: adj_fv=10005.6, ask≈10010 (9 pts below market) — too competitive
-      v3: adj_fv=10012.0, ask≈10016 (3 pts below market) — far less competitive
-    This dramatically slows ask-side fills when short, letting buys rebalance.
+    v3 fix: SKEW raised from 0.07 → 0.15.
+    v4 fix: Ask push-to-front flipped from min → max.
+      OLD: our_ask = min(our_ask, best_ask-1) → drags ask DOWN to near market
+           e.g. pos=0, best_ask=10016: our_ask=min(10004,10015)=10004 → +4 pts/fill
+      NEW: our_ask = max(our_ask, best_ask-1) → pushes ask UP to near market
+           e.g. pos=0, best_ask=10016: our_ask=max(10004,10015)=10015 → +15 pts/fill
+    3.75× more PnL per sell fill on Day 1 (wide spread market).
 
     INTARIAN_PEPPER_ROOT  (trends +1000/day)
     ────────────────────────────────────────────────────────────────────
@@ -77,7 +80,7 @@ class Trader:
             else:
                 orders = []
             result[product] = orders
-        return result, self.MARKET_ACCESS_FEE, "ROUND2_v3"
+        return result, self.MARKET_ACCESS_FEE, "ROUND2_v4"
 
     # ------------------------------------------------------------------
     # ASH_COATED_OSMIUM — inventory-skewed market maker
@@ -118,20 +121,20 @@ class Trader:
             orders.append(Order("ASH_COATED_OSMIUM", bid, -qty))
             pos -= qty
 
-        # ── MAKE: push to front of queue ────────────────────────────────
+        # ── MAKE: price-follow market, stay within adj_fv band ─────────────
+        # BID: floor at best_bid+1 so we're tied for top of bid queue
         if best_bid is not None:
             our_bid = max(our_bid, best_bid + 1)
+        # ASK: floor at best_ask-1 so we don't undercut market by a huge margin
+        #   When market ask = 10016 and our natural ask = 10004, old min() logic
+        #   dragged us to 10004 (earning only 4 pts/fill).
+        #   New max() logic: our_ask = max(10004, 10015) = 10015 → 15 pts/fill.
+        #   SKEW naturally raises adj_fv+HS as pos goes short, so ask climbs
+        #   toward market price the more short we become.
         if best_ask is not None:
-            our_ask = min(our_ask, best_ask - 1)
+            our_ask = max(our_ask, best_ask - 1)
 
-        # Inventory-aware caps (replaces hard FV±1 from v1):
-        #   adj_fv < FV when long  → cap bid lower (less eager to buy),
-        #                            floor ask lower (sell aggressively)
-        #   adj_fv > FV when short → cap bid higher (buy to cover),
-        #                            floor ask higher (don't sell more)
-        # This fixes the Day-1 problem: market bids at FV=10000, so
-        # FV-1 cap kept us at 9999 (below market) → we lost all buy flow
-        # and drifted to -80 short, stuck. Now we can bid up to adj_fv.
+        # Inventory-aware caps:
         our_bid = min(our_bid, round(adj_fv))
         our_ask = max(our_ask, round(adj_fv))
 
