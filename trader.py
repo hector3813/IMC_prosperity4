@@ -4,77 +4,97 @@ from typing import List, Dict
 
 class Trader:
     """
-    Round 3 Strategy — v3
+    Round 4 Strategy — v1
 
-    v2 failure: HYDROGEL static FV=10,000 caused two catastrophes:
-      1. TAKE-SELL at open: market bids were 10,003–10,009 (above FV=10,000)
-         → algo immediately sold 80 units in the first 200 timesteps
-      2. As market drifted to 9,935, our bids sat at 9,993 (FV-HS=10,000-7)
-         → 48 pts above market → accumulated +80 long into falling market
-         → -2,234 unrealized loss at end (80 units × 28 pts below FV)
-    Data: HYDROGEL drifted 10,020 → 9,935 (-85 pts) in this simulation.
-    Static FV=10,000 assumption is wrong — product does NOT mean-revert in
-    a single simulation run.
+    Same 12 products as Round 3. New mechanic: counterparty IDs (Mark bots).
 
-    v3 fix: DYNAMIC FV = current mid for BOTH products.
-    ────────────────────────────────────────────────────────────────────────
-    Uses a single shared MM function. No static FV, no TAKE.
-    We quote bid at adj_fv-HS and ask at adj_fv+HS where adj_fv = mid - SKEW×pos.
-    Push-to-front keeps us at best_bid+1 / best_ask-1.
-    Inventory skew automatically widens quotes when long/short to rebalance.
+    ── COUNTERPARTY ANALYSIS ───────────────────────────────────────────────────
+    Mark 38  → loses ~8 pts/fill on HYDROGEL, ~10 pts/fill on VEV_4000
+               (buys above mid, sells below mid consistently)
+               → BE the market maker against Mark 38: quote ±7 / ±9 to fill first
 
-    HYDROGEL_PACK:  HS=7  (earn ~7 pts/fill inside 15-16 pt market spread)
-    VELVETFRUIT:    HS=2  (earn ~2 pts/fill inside 4-6 pt market spread)
+    Mark 55  → loses ~2.5 pts/fill on VELVETFRUIT (always pays spread)
+               → quote ±2 on VELVETFRUIT, let Mark 55 fill us
+
+    Mark 67  → unconditional VELVETFRUIT buyer, never sells
+               → we sell VELVETFRUIT to Mark 67 at ask repeatedly
+
+    Mark 22  → profitably writes OTM VEV calls (VEV_5400/5500) to Mark 01
+               → copy: sell VEV_5400/VEV_5500, collect time value
+               → spot max in Round 4 data was 5300; both strikes require 5400/5500
+
+    ── PRODUCTS ────────────────────────────────────────────────────────────────
+    HYDROGEL_PACK       Dynamic FV MM  HS=7   SKEW=0.15  (Mark 38 = reliable flow)
+    VELVETFRUIT_EXTRACT Dynamic FV MM  HS=2   SKEW=0.05  (Mark 55+67 = fill sources)
+    VEV_4000            Dynamic FV MM  HS=9   SKEW=0.20  limit=40 (Mark 38 loses ±10)
+    VEV_5400            Sell-only OTM        limit=20   (likely expires worthless)
+    VEV_5500            Sell-only OTM        limit=20   (even safer, needs spot +250)
     """
 
     POSITION_LIMITS: Dict[str, int] = {
         "HYDROGEL_PACK":       80,
         "VELVETFRUIT_EXTRACT": 80,
+        "VEV_4000":            40,   # cap delta exposure relative to VELVETFRUIT
+        "VEV_5400":            20,   # sell-only; pos ∈ [-20, 0]
+        "VEV_5500":            20,   # sell-only; pos ∈ [-20, 0]
     }
 
-    # Shared MM parameters per product
-    # (HS, SKEW, SIZE)
+    # (half_spread, inventory_skew, order_size) per MM product
     MM_PARAMS: Dict[str, tuple] = {
         "HYDROGEL_PACK":       (7,  0.15, 25),
         "VELVETFRUIT_EXTRACT": (2,  0.05, 15),
+        "VEV_4000":            (9,  0.20, 10),
     }
+
+    OTM_SELL_STRIKES: Dict[str, int] = {
+        "VEV_5400": 5400,
+        "VEV_5500": 5500,
+    }
+    OTM_SELL_SIZE = 5
+
+    def __init__(self):
+        self._spot: float | None = None
 
     # ──────────────────────────────────────────────────────────────────────────
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
+
+        # Track live VELVETFRUIT mid-price (needed for OTM VEV filtering)
+        vf_od = state.order_depths.get("VELVETFRUIT_EXTRACT")
+        if vf_od:
+            bb = max(vf_od.buy_orders)  if vf_od.buy_orders  else None
+            ba = min(vf_od.sell_orders) if vf_od.sell_orders else None
+            if   bb is not None and ba is not None:
+                self._spot = (bb + ba) / 2.0
+            elif bb is not None:
+                self._spot = float(bb)
+            elif ba is not None:
+                self._spot = float(ba)
+
         for product, od in state.order_depths.items():
             pos = state.position.get(product, 0)
             lim = self.POSITION_LIMITS.get(product, 0)
+
             if product in self.MM_PARAMS:
                 hs, skew, size = self.MM_PARAMS[product]
                 orders = self._trade_mm(od, pos, lim, product, hs, skew, size)
+            elif product in self.OTM_SELL_STRIKES and lim > 0:
+                strike = self.OTM_SELL_STRIKES[product]
+                orders = self._sell_otm_vev(od, pos, lim, product, strike)
             else:
-                orders = []   # skip all VEVs
+                orders = []
+
             result[product] = orders
-        return result, 0, "ROUND3_v3"
+
+        return result, 0, "ROUND4_v1"
 
     # ──────────────────────────────────────────────────────────────────────────
     def _trade_mm(self, od: OrderDepth, pos: int, lim: int,
                   product: str, hs: int, skew: float, size: int) -> List[Order]:
         """
         Dynamic-FV market maker.
-
-        FV = current mid-price (no static reference — follows market wherever it goes).
-        adj_fv = mid - skew × pos  (inventory skew shades quotes to rebalance position)
-
-        Quote structure:
-          bid = adj_fv - hs  →  pushed up to best_bid+1 (queue priority)
-                             →  capped at adj_fv (never bid above FV estimate)
-          ask = adj_fv + hs  →  pushed down to best_ask-1 (queue priority)
-                             →  floored at adj_fv (never ask below FV estimate)
-
-        Effect of skew when LONG (pos > 0):
-          adj_fv < mid → our bid is pushed below market → fewer buys
-                       → our ask is lower → more aggressive selling → rebalances
-
-        Effect of skew when SHORT (pos < 0):
-          adj_fv > mid → our bid is higher → more aggressive buying → rebalances
-                       → our ask is pushed up → fewer sells
+        FV = current mid — follows market wherever it goes, no directional bet.
+        Inventory skew (adj_fv = mid - skew×pos) shades quotes to rebalance.
         """
         orders: List[Order] = []
         best_bid = max(od.buy_orders)  if od.buy_orders  else None
@@ -88,15 +108,15 @@ class Trader:
         our_bid = round(adj_fv - hs)
         our_ask = round(adj_fv + hs)
 
-        # ── Push to front of queue ───────────────────────────────────────────
+        # Push to front of queue
         our_bid = max(our_bid, best_bid + 1)
         our_ask = min(our_ask, best_ask - 1)
 
-        # ── Inventory-aware caps (never bid above adj_fv / ask below adj_fv) ─
+        # Inventory-aware caps
         our_bid = min(our_bid, round(adj_fv))
         our_ask = max(our_ask, round(adj_fv))
 
-        # ── Safety: no crossing ──────────────────────────────────────────────
+        # Safety checks
         if our_bid >= best_ask:
             our_bid = best_ask - 1
         if our_ask <= best_bid:
@@ -112,3 +132,34 @@ class Trader:
             orders.append(Order(product, our_ask, -min(size, sell_cap)))
 
         return orders
+
+    # ──────────────────────────────────────────────────────────────────────────
+    def _sell_otm_vev(self, od: OrderDepth, pos: int, lim: int,
+                      product: str, strike: int) -> List[Order]:
+        """
+        Sell OTM call options at market to collect time value.
+        Mark 22 does this profitably vs Mark 01.
+
+        Only sell when spot < strike (genuinely OTM).
+        Post ask at best_bid+1 to be at front of ask queue.
+        Never buy (hold short position until expiry or close cheaply).
+        """
+        if self._spot is None or self._spot >= strike:
+            return []   # don't sell if we're ITM — risk too high
+
+        best_bid = max(od.buy_orders)  if od.buy_orders  else None
+        best_ask = min(od.sell_orders) if od.sell_orders else None
+
+        sell_cap = lim + pos   # = lim when pos=0, = 0 when pos=-lim
+        if sell_cap <= 0 or best_bid is None or best_bid <= 0:
+            return []
+
+        # Post at best_bid+1 (front of ask queue, capture the spread)
+        sell_price = best_bid + 1
+        if best_ask is not None and sell_price >= best_ask:
+            sell_price = best_ask - 1
+        if sell_price <= 0:
+            return []
+
+        qty = min(self.OTM_SELL_SIZE, sell_cap)
+        return [Order(product, sell_price, -qty)] if qty > 0 else []
