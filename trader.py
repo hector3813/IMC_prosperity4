@@ -4,7 +4,7 @@ from typing import List, Dict
 
 class Trader:
     """
-    Round 4 Strategy — v1
+    Round 4 Strategy — v2
 
     Same 12 products as Round 3. New mechanic: counterparty IDs (Mark bots).
 
@@ -27,26 +27,37 @@ class Trader:
     HYDROGEL_PACK       Dynamic FV MM  HS=7   SKEW=0.15  (Mark 38 = reliable flow)
     VELVETFRUIT_EXTRACT Dynamic FV MM  HS=2   SKEW=0.05  (Mark 55+67 = fill sources)
     VEV_4000            Dynamic FV MM  HS=9   SKEW=0.20  limit=40 (Mark 38 loses ±10)
-    VEV_5400            Sell-only OTM        limit=20   (likely expires worthless)
-    VEV_5500            Sell-only OTM        limit=20   (even safer, needs spot +250)
+    VEV_5300            Sell-only OTM        limit=15   (spot 5253, strike 5300 = 47 OTM)
+    VEV_5400            Sell-only OTM        limit=30   (spot needs +147 to go ITM)
+    VEV_5500            Sell-only OTM        limit=30   (spot needs +247, very safe)
+
+    v1 results: +820 total. v2 improvements:
+      VELVETFRUIT SKEW 0.05→0.10: v1 accumulated 31 units long into -42pt downtrend
+        = -382 XIRECS inventory loss. Stronger skew prevents drift.
+      HYDROGEL   SKEW 0.15→0.20: v1 ended +18 units long, ~-280 unrealized PnL.
+      VEV_4000   HS 9→8, SIZE 10→15: only 9 fills in v1 despite good ±16pt edge.
+      VEV_5300   added: sold at ~46pts in Round 4 data; 15 units × 46 = +690 if OTM.
+      VEV_5400/5500 limits 20→30: sold out in first 300 timestamps at peak prices.
     """
 
     POSITION_LIMITS: Dict[str, int] = {
         "HYDROGEL_PACK":       80,
         "VELVETFRUIT_EXTRACT": 80,
         "VEV_4000":            40,   # cap delta exposure relative to VELVETFRUIT
-        "VEV_5400":            20,   # sell-only; pos ∈ [-20, 0]
-        "VEV_5500":            20,   # sell-only; pos ∈ [-20, 0]
+        "VEV_5300":            15,   # sell-only OTM; spot at 5253, strike 5300
+        "VEV_5400":            30,   # increased from 20 (sold out instantly in v1)
+        "VEV_5500":            30,   # increased from 20
     }
 
     # (half_spread, inventory_skew, order_size) per MM product
     MM_PARAMS: Dict[str, tuple] = {
-        "HYDROGEL_PACK":       (7,  0.15, 25),
-        "VELVETFRUIT_EXTRACT": (2,  0.05, 15),
-        "VEV_4000":            (9,  0.20, 10),
+        "HYDROGEL_PACK":       (7,  0.20, 25),   # SKEW 0.15→0.20: tighter inventory
+        "VELVETFRUIT_EXTRACT": (2,  0.10, 15),   # SKEW 0.05→0.10: prevent long drift
+        "VEV_4000":            (8,  0.20, 15),   # HS 9→8, SIZE 10→15: more fills
     }
 
     OTM_SELL_STRIKES: Dict[str, int] = {
+        "VEV_5300": 5300,   # new: spot at 5253, OTM by 47 pts, all time-value
         "VEV_5400": 5400,
         "VEV_5500": 5500,
     }
@@ -86,7 +97,7 @@ class Trader:
 
             result[product] = orders
 
-        return result, 0, "ROUND4_v1"
+        return result, 0, "ROUND4_v2"
 
     # ──────────────────────────────────────────────────────────────────────────
     def _trade_mm(self, od: OrderDepth, pos: int, lim: int,
