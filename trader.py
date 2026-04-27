@@ -4,64 +4,64 @@ from typing import List, Dict
 
 class Trader:
     """
-    Round 4 Strategy — v2
-
-    Same 12 products as Round 3. New mechanic: counterparty IDs (Mark bots).
+    Round 4 Strategy — v3
 
     ── COUNTERPARTY ANALYSIS ───────────────────────────────────────────────────
-    Mark 38  → loses ~8 pts/fill on HYDROGEL, ~10 pts/fill on VEV_4000
-               (buys above mid, sells below mid consistently)
-               → BE the market maker against Mark 38: quote ±7 / ±9 to fill first
-
-    Mark 55  → loses ~2.5 pts/fill on VELVETFRUIT (always pays spread)
-               → quote ±2 on VELVETFRUIT, let Mark 55 fill us
-
+    Mark 38  → loses ±8pts/fill on HYDROGEL, ±10pts on VEV_4000
+    Mark 55  → loses ±2.5pts/fill on VELVETFRUIT
     Mark 67  → unconditional VELVETFRUIT buyer, never sells
-               → we sell VELVETFRUIT to Mark 67 at ask repeatedly
+    Mark 22  → writes OTM/near-ATM VEV calls profitably to Mark 01
 
-    Mark 22  → profitably writes OTM VEV calls (VEV_5400/5500) to Mark 01
-               → copy: sell VEV_5400/VEV_5500, collect time value
-               → spot max in Round 4 data was 5300; both strikes require 5400/5500
+    ── v2 results: +1,223. v3 improvements ─────────────────────────────────────
+    VEV_5200 ADDED (biggest miss):
+      Spot started 5295.5, ended 5253.5. VEV_5200 (strike 5200) started at mid ~120,
+      expired at intrinsic 53.5. Selling 20 units at ~120 = +66.5/unit × 20 = +1,330
+      left on table. Only sell when spot < strike+100 (= 5300) to limit delta risk.
+      Time value at start ~24.5pts. Profitable if spot doesn't rise +45pts from strike.
+
+    HYDROGEL SKEW 0.20→0.30 (second biggest fix):
+      v2 accumulated +31 units long at peak mid (~10,061), then mid reverted -44pts
+      → -872 HYDROGEL drawdown (inventory loss). SKEW=0.30 makes ask aggressive when
+      long (at pos=+31: ask at mid-2.3, cheapest seller by 10pts → sells fast).
+
+    VEV_5200 limit=20, VEV_5300 limit 15→20 (more premium collected).
 
     ── PRODUCTS ────────────────────────────────────────────────────────────────
-    HYDROGEL_PACK       Dynamic FV MM  HS=7   SKEW=0.15  (Mark 38 = reliable flow)
-    VELVETFRUIT_EXTRACT Dynamic FV MM  HS=2   SKEW=0.05  (Mark 55+67 = fill sources)
-    VEV_4000            Dynamic FV MM  HS=9   SKEW=0.20  limit=40 (Mark 38 loses ±10)
-    VEV_5300            Sell-only OTM        limit=15   (spot 5253, strike 5300 = 47 OTM)
-    VEV_5400            Sell-only OTM        limit=30   (spot needs +147 to go ITM)
-    VEV_5500            Sell-only OTM        limit=30   (spot needs +247, very safe)
-
-    v1 results: +820 total. v2 improvements:
-      VELVETFRUIT SKEW 0.05→0.10: v1 accumulated 31 units long into -42pt downtrend
-        = -382 XIRECS inventory loss. Stronger skew prevents drift.
-      HYDROGEL   SKEW 0.15→0.20: v1 ended +18 units long, ~-280 unrealized PnL.
-      VEV_4000   HS 9→8, SIZE 10→15: only 9 fills in v1 despite good ±16pt edge.
-      VEV_5300   added: sold at ~46pts in Round 4 data; 15 units × 46 = +690 if OTM.
-      VEV_5400/5500 limits 20→30: sold out in first 300 timestamps at peak prices.
+    HYDROGEL_PACK       Dynamic FV MM  HS=7  SKEW=0.30  SIZE=25
+    VELVETFRUIT_EXTRACT Dynamic FV MM  HS=2  SKEW=0.10  SIZE=15
+    VEV_4000            Dynamic FV MM  HS=8  SKEW=0.20  SIZE=15  limit=40
+    VEV_5200            Sell time-value  limit=20  (spot<5300 guard)
+    VEV_5300            Sell OTM         limit=20
+    VEV_5400            Sell OTM         limit=30
+    VEV_5500            Sell OTM         limit=30
     """
 
     POSITION_LIMITS: Dict[str, int] = {
         "HYDROGEL_PACK":       80,
         "VELVETFRUIT_EXTRACT": 80,
-        "VEV_4000":            40,   # cap delta exposure relative to VELVETFRUIT
-        "VEV_5300":            15,   # sell-only OTM; spot at 5253, strike 5300
-        "VEV_5400":            30,   # increased from 20 (sold out instantly in v1)
-        "VEV_5500":            30,   # increased from 20
+        "VEV_4000":            40,
+        "VEV_5200":            20,   # new: sell TV; spot 5253 < 5300 guard
+        "VEV_5300":            20,   # limit 15→20
+        "VEV_5400":            30,
+        "VEV_5500":            30,
     }
 
-    # (half_spread, inventory_skew, order_size) per MM product
     MM_PARAMS: Dict[str, tuple] = {
-        "HYDROGEL_PACK":       (7,  0.20, 25),   # SKEW 0.15→0.20: tighter inventory
-        "VELVETFRUIT_EXTRACT": (2,  0.10, 15),   # SKEW 0.05→0.10: prevent long drift
-        "VEV_4000":            (8,  0.20, 15),   # HS 9→8, SIZE 10→15: more fills
+        "HYDROGEL_PACK":       (7,  0.30, 25),   # SKEW 0.20→0.30: prevent +31 overhang
+        "VELVETFRUIT_EXTRACT": (2,  0.10, 15),
+        "VEV_4000":            (8,  0.20, 15),
     }
 
+    # Sell these products (go short) to collect time value.
+    # Key: strike. Only sell when spot < strike + OTM_SELL_MAX_ITM
     OTM_SELL_STRIKES: Dict[str, int] = {
-        "VEV_5300": 5300,   # new: spot at 5253, OTM by 47 pts, all time-value
+        "VEV_5200": 5200,   # ITM but with significant TV (~24pts); sell when spot<5300
+        "VEV_5300": 5300,
         "VEV_5400": 5400,
         "VEV_5500": 5500,
     }
-    OTM_SELL_SIZE = 5
+    OTM_SELL_MAX_ITM = 100   # don't sell if spot >= strike + 100 (delta risk too high)
+    OTM_SELL_SIZE    = 5
 
     def __init__(self):
         self._spot: float | None = None
@@ -70,7 +70,6 @@ class Trader:
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
 
-        # Track live VELVETFRUIT mid-price (needed for OTM VEV filtering)
         vf_od = state.order_depths.get("VELVETFRUIT_EXTRACT")
         if vf_od:
             bb = max(vf_od.buy_orders)  if vf_od.buy_orders  else None
@@ -91,22 +90,18 @@ class Trader:
                 orders = self._trade_mm(od, pos, lim, product, hs, skew, size)
             elif product in self.OTM_SELL_STRIKES and lim > 0:
                 strike = self.OTM_SELL_STRIKES[product]
-                orders = self._sell_otm_vev(od, pos, lim, product, strike)
+                orders = self._sell_vev(od, pos, lim, product, strike)
             else:
                 orders = []
 
             result[product] = orders
 
-        return result, 0, "ROUND4_v2"
+        return result, 0, "ROUND4_v3"
 
     # ──────────────────────────────────────────────────────────────────────────
     def _trade_mm(self, od: OrderDepth, pos: int, lim: int,
                   product: str, hs: int, skew: float, size: int) -> List[Order]:
-        """
-        Dynamic-FV market maker.
-        FV = current mid — follows market wherever it goes, no directional bet.
-        Inventory skew (adj_fv = mid - skew×pos) shades quotes to rebalance.
-        """
+        """Dynamic-FV market maker. FV = current mid. Inventory skew rebalances."""
         orders: List[Order] = []
         best_bid = max(od.buy_orders)  if od.buy_orders  else None
         best_ask = min(od.sell_orders) if od.sell_orders else None
@@ -119,15 +114,12 @@ class Trader:
         our_bid = round(adj_fv - hs)
         our_ask = round(adj_fv + hs)
 
-        # Push to front of queue
         our_bid = max(our_bid, best_bid + 1)
         our_ask = min(our_ask, best_ask - 1)
 
-        # Inventory-aware caps
         our_bid = min(our_bid, round(adj_fv))
         our_ask = max(our_ask, round(adj_fv))
 
-        # Safety checks
         if our_bid >= best_ask:
             our_bid = best_ask - 1
         if our_ask <= best_bid:
@@ -145,18 +137,23 @@ class Trader:
         return orders
 
     # ──────────────────────────────────────────────────────────────────────────
-    def _sell_otm_vev(self, od: OrderDepth, pos: int, lim: int,
-                      product: str, strike: int) -> List[Order]:
+    def _sell_vev(self, od: OrderDepth, pos: int, lim: int,
+                  product: str, strike: int) -> List[Order]:
         """
-        Sell OTM call options at market to collect time value.
-        Mark 22 does this profitably vs Mark 01.
+        Sell VEV calls to collect time value. Works for OTM and near-ITM options.
 
-        Only sell when spot < strike (genuinely OTM).
-        Post ask at best_bid+1 to be at front of ask queue.
-        Never buy (hold short position until expiry or close cheaply).
+        Guard: only sell when spot < strike + OTM_SELL_MAX_ITM (=100).
+          - VEV_5200 (strike 5200): sell when spot < 5300  → spot=5253 ✓
+          - VEV_5300 (strike 5300): sell when spot < 5400  → spot=5253 ✓
+          - VEV_5400/5500: always OTM at current spot levels
+
+        Post ask at best_bid+1 to be at front of queue.
+        Positions go short (negative) — held to expiry for full premium.
         """
-        if self._spot is None or self._spot >= strike:
-            return []   # don't sell if we're ITM — risk too high
+        if self._spot is None:
+            return []
+        if self._spot >= strike + self.OTM_SELL_MAX_ITM:
+            return []   # delta risk too high if deeply ITM
 
         best_bid = max(od.buy_orders)  if od.buy_orders  else None
         best_ask = min(od.sell_orders) if od.sell_orders else None
@@ -165,7 +162,6 @@ class Trader:
         if sell_cap <= 0 or best_bid is None or best_bid <= 0:
             return []
 
-        # Post at best_bid+1 (front of ask queue, capture the spread)
         sell_price = best_bid + 1
         if best_ask is not None and sell_price >= best_ask:
             sell_price = best_ask - 1
